@@ -1,0 +1,259 @@
+---
+title: "p8105_hw6_yf2735"
+author: "Yujing FU"
+date: "2024-12-02"
+output: github_document
+---
+```{r setup, include=FALSE}
+library(tidyverse)
+library(janitor)
+library(rvest)
+library(httr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+knitr::opts_chunk$set(
+  fig.width = 6,
+  fig.asp = .6,
+  out.width = "90%"
+)
+```
+
+### Problem 1
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+```
+```{r}
+# bootstrap
+set.seed(11)
+n_sample = 5000
+
+# bootstrap model
+bootstrap_results = replicate(n_sample, {
+  boot_sample = weather_df  |>  slice_sample(n = nrow(weather_df), replace = TRUE)
+  
+  # LR model
+  fit = lm(tmax ~ tmin, data = boot_sample)
+  
+  r2 = glance(fit)$r.squared
+  coefs = tidy(fit) |>  pull(estimate)
+  log_beta_prod = log(coefs[1] * coefs[2])
+  
+  # return results
+  c(r2 = r2, log_beta_prod = log_beta_prod)
+}, simplify = TRUE)  |>  t() |>  as.data.frame()
+
+# name results
+colnames(bootstrap_results) = c("r2", "log_beta_prod")
+
+# plot
+p1 = ggplot(bootstrap_results, aes(x = r2)) +
+  geom_density(fill = "blue", alpha = 0.7, adjust = 2) +
+  theme_minimal() +
+  labs(title = "Distribution of r^2", x = "r^2", y = "Frequency")
+
+p2 = ggplot(bootstrap_results, aes(x = log_beta_prod)) +
+  geom_density(fill = "pink", alpha = 0.7, adjust = 2) +
+  theme_minimal() +
+  labs(title = "Distribution of log(β^0 × β^1)", x = "log(β^0 × β^1)", y = "Frequency")
+
+p1
+p2
+
+# 95% confidence interval
+ci_r2 = quantile(bootstrap_results$r2, probs = c(0.025, 0.975))
+ci_log_beta_prod = quantile(bootstrap_results$log_beta_prod, probs = c(0.025, 0.975))
+
+list(
+  ci_r2 = ci_r2,
+  ci_log_beta_prod = ci_log_beta_prod)
+```
+The blue plot shows a smooth density curve for the `r2`, which is unimodal and slightly left-skewed, with most values concentrated between approximately 0.89 and 0.93. The peak is around 0.91, indicating that most samples have R squared value around 0.91. This means the model can explain the relationship bewteen `tmax` and `tmin` quite well. The 95% confidence interval for `r2` is [0.8938394, 0.9272746]. 
+
+The pink plot shows a density curve for `log_beta_prod`, which is unimodal and symmetric, centered around a mean of approximately 2.02. The 95% confidence interval for this is [1.964577 2.059025], which is quite narrow, suggesting high precision in the estimates.
+
+### Problem 2
+```{r}
+homicides_raw_df = read.csv("https://raw.githubusercontent.com/washingtonpost/data-homicides/refs/heads/master/homicide-data.csv")
+```
+
+```{r}
+# clean the data
+homicides_df =
+  homicides_raw_df |> 
+  mutate(city_state = paste(city, state, sep = ", ")) |> 
+  mutate(homicide_bi = case_when(
+    disposition == "Closed by arrest" ~ 1,
+    TRUE ~ 0
+  )) |> 
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"))|> 
+  filter(victim_race %in% c("White", "Black")) |> 
+  mutate(victim_age = as.numeric(victim_age)) |> 
+  drop_na()
+```
+
+```{r}
+baltimore_df = 
+  homicides_df |> 
+  filter(city_state == "Baltimore, MD")
+
+baltimore_glm = glm(
+    homicide_bi ~ victim_age + victim_sex + victim_race,
+    data = baltimore_df,
+    family = binomial #logit
+  )
+
+baltimore_results =
+  broom::tidy(baltimore_glm, exponentiate = TRUE, conf.int = TRUE) |> 
+  # exponentiate transfer log-odds to odds ratio, adjusted odds ratio
+  filter(term == "victim_sexMale")
+
+baltimore_results
+
+```
+The result shows that the probability of cases with male victims being solved is 0.43 times that of female victims. At the 95% confidence level, the adjusted odds ratio for case resolution for male victims may range between 0.32 and 0.56. The confidence interval is [0.3241908, 0.5575508] and does not include 1, indicating that the gender difference is statistically significant.
+
+```{r}
+# glm for each cities
+city_results = 
+  homicides_df |> 
+  group_by(city_state) |> 
+  nest() |> 
+  mutate(
+    glm_model = map(data, ~ glm(homicide_bi ~ victim_age + victim_sex + victim_race,data = ., family = binomial)),
+    tidy_results = map(glm_model, ~ broom::tidy(., exponentiate = TRUE, conf.int = TRUE))
+  ) |> 
+  unnest(tidy_results) |> 
+  filter(term == "victim_sexMale") |> 
+  select(city_state, estimate, conf.low, conf.high)
+```
+
+```{r}
+# plot for each cities
+city_results |> 
+  arrange(estimate) |> 
+  mutate(city_state = factor(city_state, levels = city_state)) |> 
+  ggplot(aes(x = city_state, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  coord_flip() +
+  labs(
+    x = "City, State",
+    y = "Adjusted Odds Ratio (Male vs Female)",
+    title = "Adjusted ORs for Solving Homicides by City"
+  ) +
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 5))
+```
+Many cities have an adjusted odds ratio less than 1, indicating the homicide cases with a female victims are more likely to be solved. However, there are mostly not statistically significant.
+Most cities have the adjusted odds ratio near 1, and with their confidence interval containing 1. This means that it's statistically significant that there are no significant gender effect in those cities (such as Tulsa, OK).
+
+
+### Problem 3
+
+```{r}
+birth_df = 
+  read.csv("data/birthweight.csv") |> 
+  mutate(
+    babysex = factor(babysex, labels = c("Male", "Female")),
+    frace = factor(frace, labels = c("White", "Black", "Asian", "Puerto Rican", "Other")),
+    malform = factor(malform, labels = c("Absent", "Present")),
+    mrace = factor(mrace, labels = c("White", "Black", "Asian", "Puerto Rican"))) |> 
+    drop_na()
+```
+
+```{r}
+# regression model for birthweight(bwt)
+# model 1:
+model_1 = lm(bwt ~ gaweeks + momage + ppbmi + babysex + malform, data = birth_df)
+
+summary(model_1)
+
+birth_df1 =
+  birth_df |> 
+  modelr::add_residuals(model_1, var = "residual_bwt") |> 
+  modelr::add_predictions(model_1, var = "predicted_bwt") 
+
+ggplot(birth_df1, aes(x = predicted_bwt, y = residual_bwt)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Residuals vs Fitted Values", x = "Fitted Values", y = "Residuals")
+
+
+```
+Modeling process:<br>
+This model includes predictors such as `gaweeks`, `momage`, `ppbmi`, `babysex`, `malform`. They are hypothesized to affect birth weight. Then I performed a linear regression.<be>
+
+The plot shows that fitted values (predicted birth weight) are centered around 3200 grams, which means the average birth weight predicted by the model is approximately 3200 grams. The residuals mainly concentrated around -1000 to 1000. This shows that some model’s predictions are off by a significant margin.And there is no clear linear relationship between residuals and the fitted values.
+
+
+```{r}
+# model 2
+model_2 = lm(bwt ~ blength + gaweeks, data = birth_df)
+summary(model_2)
+# model 3
+model_3 = lm(bwt ~ bhead * blength * babysex, data = birth_df)
+summary(model_3)
+```
+
+
+```{r}
+cross_validate <- function(data, n_splits = 5) {
+  set.seed(123) 
+  
+  # Perform cross-validation
+  results <- map(1:n_splits, ~{
+    # Randomly split the data
+    train_index <- sample(1:nrow(data), size = 0.8 * nrow(data))
+    train_data <- data[train_index, ]
+    test_data <- data[-train_index, ]
+    
+    # Fit the three models on the training data
+    model_1 <- lm(bwt ~ gaweeks + momage + ppbmi + babysex + malform, data = train_data)
+    model_2 <- lm(bwt ~ blength + gaweeks, data = train_data)
+    model_3 <- lm(bwt ~ bhead * blength * babysex, data = train_data)
+    
+    # Calculate MSE for each model on the test data
+    model_1_mse <- mean((test_data$bwt - predict(model_1, newdata = test_data))^2)
+    model_2_mse <- mean((test_data$bwt - predict(model_2, newdata = test_data))^2)
+    model_3_mse <- mean((test_data$bwt - predict(model_3, newdata = test_data))^2)
+    
+    # Return results
+    list(model_1_mse = model_1_mse, model_2_mse = model_2_mse, model_3_mse = model_3_mse)
+  })
+  
+  # Combine results into a data frame
+  mse_df <- map_dfr(results, ~as.data.frame(.))
+  return(mse_df)
+}
+
+# Apply cross-validation using birth_df
+cv_results <- cross_validate(birth_df, n_splits = 5)
+
+# Summarize the results
+cv_summary <- cv_results  |> 
+  summarise(
+    model_1_mse = mean(model_1_mse),
+    model_2_mse = mean(model_2_mse),
+    model_3_mse = mean(model_3_mse)
+  )
+
+# Print the summary
+print(cv_summary)
+
+```
+
+The cross-validation results indicate that Model 3, which includes interaction terms, performs best in terms of predictive accuracy, because it has the lowest MSE. Model 2 is the second best and Model 3 is the worst among those three models.
+
+
